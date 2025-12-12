@@ -1,5 +1,5 @@
 # ============================================================
-# BG678 群发机器人（Webhook 稳定版 / Railway 适用 / PTB v20+）
+# BG678 群发机器人（Webhook 稳定版 / Railway 适用 / PTB v21.7+）
 # 功能：
 # - /start 显示菜单（仅管理员）
 # - /id 查看自己的 Telegram 数字ID（任何人可用）
@@ -10,6 +10,7 @@
 # - 私聊：每日循环发送（每天固定时间）
 # - 任务：查看 / 编辑内容 / 删除 / 启用停用
 # - 重启自动恢复 schedule/daily 任务（从 posts.json）
+# - 新增：若文本/标题/说明中包含 (礼包码)，自动生成“点击复制礼包码”按钮
 # ============================================================
 
 import os
@@ -18,8 +19,8 @@ import json
 import uuid
 import logging
 from pathlib import Path
-from datetime import datetime, time as dtime
-from typing import Optional, Dict, List, Any, Set
+from datetime import datetime, timedelta, timezone, time as dtime
+from typing import Optional, Dict, List, Any, Set, Tuple
 
 from telegram import (
     Update,
@@ -27,6 +28,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    CopyTextButton,   # ✅ PTB v21.7+
 )
 from telegram.ext import (
     Application,
@@ -38,11 +40,15 @@ from telegram.ext import (
 )
 
 # =========================
-# 环境变量（你在 Railway Variables 里填）
+# 环境变量（Railway Variables 里填）
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # https://xxxx.up.railway.app
 PORT = int(os.getenv("PORT", "8080"))
+
+# 你在柬埔寨一般 +7，如需改成 +8：TZ_OFFSET=8
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "7"))
+LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET))
 
 def parse_admin_ids() -> Set[int]:
     raw = os.getenv("ADMIN_IDS", "").strip()
@@ -117,7 +123,7 @@ def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 def now_local() -> datetime:
-    return datetime.now()
+    return datetime.now(tz=LOCAL_TZ)
 
 def gen_id() -> str:
     return uuid.uuid4().hex[:8]
@@ -152,12 +158,14 @@ def content_from_message(msg) -> Dict[str, Any]:
     return {"type": "text", "text": msg.text or msg.caption or ""}
 
 def parse_dt_full(text: str) -> Optional[datetime]:
+    """支持：YYYY/MM/DD HH:MM 或 YYYY/MM/DD HH:MM:SS，默认 LOCAL_TZ"""
     if not text:
         return None
     t = text.strip().replace("：", ":")
     for fmt in ("%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
         try:
-            return datetime.strptime(t, fmt)
+            dt = datetime.strptime(t, fmt)
+            return dt.replace(tzinfo=LOCAL_TZ)
         except Exception:
             pass
     return None
@@ -182,13 +190,13 @@ def parse_time_flexible(text: str) -> Optional[dtime]:
 
 def today_dt(tm: dtime) -> datetime:
     n = now_local()
-    return datetime(n.year, n.month, n.day, tm.hour, tm.minute, tm.second)
+    return datetime(n.year, n.month, n.day, tm.hour, tm.minute, tm.second, tzinfo=LOCAL_TZ)
 
 def get_post(posts: List[Dict[str, Any]], post_id: str) -> Optional[Dict[str, Any]]:
     return next((x for x in posts if x.get("id") == post_id), None)
 
 def remove_jobs_by_name(job_queue, name: str):
-    if not name:
+    if not job_queue or not name:
         return
     for j in job_queue.get_jobs_by_name(name):
         j.schedule_removal()
@@ -222,6 +230,58 @@ def build_group_keyboard(prefix: str, selected: Set[str]) -> InlineKeyboardMarku
     ])
     return InlineKeyboardMarkup(kb)
 
+def ensure_job_queue(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """JobQueue 缺失时，避免你看到‘完全没反应’"""
+    if getattr(context, "job_queue", None) is None:
+        return False
+    return True
+
+# =========================
+# 一键复制礼包码（识别括号里的内容）
+# =========================
+COUPON_RE = re.compile(r"\(([^()\n]{1,256})\)")
+
+def extract_coupon(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = COUPON_RE.search(text)
+    if not m:
+        return None
+    code = m.group(1).strip()
+    if not code:
+        return None
+    return code
+
+def build_copy_keyboard(code: str) -> InlineKeyboardMarkup:
+    # ✅ Telegram 原生“复制到剪贴板”按钮
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 点击复制礼包码", copy_text=CopyTextButton(code))]
+    ])
+
+async def send_content_with_optional_copy(context: ContextTypes.DEFAULT_TYPE, chat_id: int, content: Dict[str, Any]):
+    """
+    按原样发送文本/图片；如果正文/caption 中有 (xxx) 则自动加复制按钮。
+    """
+    if content.get("type") == "photo":
+        caption = content.get("caption", "") or ""
+        code = extract_coupon(caption)
+        rm = build_copy_keyboard(code) if code else None
+        return await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=content.get("photo_id"),
+            caption=caption,
+            reply_markup=rm
+        )
+    else:
+        text = content.get("text", "") or ""
+        code = extract_coupon(text)
+        rm = build_copy_keyboard(code) if code else None
+        return await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=rm
+        )
+
 # =========================
 # 基础命令
 # =========================
@@ -248,6 +308,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     g = load_groups()
     p = load_posts()
+    jq = "OK" if getattr(context, "job_queue", None) is not None else "MISSING"
     await update.message.reply_text(
         "🧪 Debug\n"
         f"BASE_DIR: {BASE_DIR}\n"
@@ -255,6 +316,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"posts_file: {POSTS_FILE}\n"
         f"群数量: {len(g)}\n"
         f"任务数量: {len(p)}\n"
+        f"job_queue: {jq}\n"
+        f"TZ_OFFSET: {TZ_OFFSET}\n"
         f"groups: {g}"
     )
 
@@ -276,8 +339,6 @@ async def register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     groups = load_groups()
     groups[str(chat.id)] = chat.title or f"group_{chat.id}"
     save_groups(groups)
-
-    # 群内提示（不删除，避免你误以为没反应）
     await update.message.reply_text(f"✅ 已绑定群：{groups[str(chat.id)]}")
 
 async def unregister_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -442,17 +503,7 @@ async def immediate_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for cid in selected:
         try:
-            if content["type"] == "photo":
-                await context.bot.send_photo(
-                    chat_id=int(cid),
-                    photo=content["photo_id"],
-                    caption=content.get("caption", "")
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=int(cid),
-                    text=content.get("text", "")
-                )
+            await send_content_with_optional_copy(context, int(cid), content)
             sent += 1
         except Exception as e:
             failed += 1
@@ -570,6 +621,11 @@ async def schedule_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if step == S_AWAIT_CONTENT:
+        if not ensure_job_queue(context):
+            await msg.reply_text("❗ 当前环境缺少 JobQueue 依赖（context.job_queue=None）。请按我给的 requirements.txt 安装 PTB job-queue。", reply_markup=MAIN_KEYBOARD)
+            context.user_data.clear()
+            return
+
         groups_map = load_groups()
         selected: Set[str] = set(context.user_data.get(SELECTED_GROUPS, set()))
         selected = {cid for cid in selected if cid in groups_map}
@@ -600,7 +656,9 @@ async def schedule_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_posts(posts)
 
         dt = datetime.fromisoformat(send_time)
-        delay = (dt - now_local()).total_seconds()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        delay = max(1, int((dt - now_local()).total_seconds()))
 
         context.job_queue.run_once(
             schedule_execute_job,
@@ -627,22 +685,12 @@ async def schedule_execute_job(context: ContextTypes.DEFAULT_TYPE):
     sent_msgs = []
     for cid in groups:
         try:
-            if content.get("type") == "photo":
-                m = await context.bot.send_photo(
-                    chat_id=int(cid),
-                    photo=content.get("photo_id"),
-                    caption=content.get("caption", "")
-                )
-            else:
-                m = await context.bot.send_message(
-                    chat_id=int(cid),
-                    text=content.get("text", "")
-                )
+            m = await send_content_with_optional_copy(context, int(cid), content)
             sent_msgs.append({"chat_id": cid, "message_id": m.message_id})
         except Exception as e:
             logger.error(f"[定时发送失败] post={post_id} chat={cid} err={e}")
 
-    if delete_minutes > 0 and sent_msgs:
+    if delete_minutes > 0 and sent_msgs and getattr(context, "job_queue", None) is not None:
         context.job_queue.run_once(
             delete_messages_job,
             when=delete_minutes * 60,
@@ -752,6 +800,11 @@ async def daily_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if step == S_AWAIT_CONTENT:
+        if not ensure_job_queue(context):
+            await msg.reply_text("❗ 当前环境缺少 JobQueue 依赖（context.job_queue=None）。请按我给的 requirements.txt 安装 PTB job-queue。", reply_markup=MAIN_KEYBOARD)
+            context.user_data.clear()
+            return
+
         groups_map = load_groups()
         selected: Set[str] = set(context.user_data.get(SELECTED_GROUPS, set()))
         selected = {cid for cid in selected if cid in groups_map}
@@ -807,22 +860,12 @@ async def daily_execute_job(context: ContextTypes.DEFAULT_TYPE):
     sent_msgs = []
     for cid in groups:
         try:
-            if content.get("type") == "photo":
-                m = await context.bot.send_photo(
-                    chat_id=int(cid),
-                    photo=content.get("photo_id"),
-                    caption=content.get("caption", "")
-                )
-            else:
-                m = await context.bot.send_message(
-                    chat_id=int(cid),
-                    text=content.get("text", "")
-                )
+            m = await send_content_with_optional_copy(context, int(cid), content)
             sent_msgs.append({"chat_id": cid, "message_id": m.message_id})
         except Exception as e:
             logger.error(f"[每日发送失败] post={post_id} chat={cid} err={e}")
 
-    if delete_minutes > 0 and sent_msgs:
+    if delete_minutes > 0 and sent_msgs and getattr(context, "job_queue", None) is not None:
         context.job_queue.run_once(
             delete_messages_job,
             when=delete_minutes * 60,
@@ -911,13 +954,15 @@ async def post_edit_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_posts(posts)
 
     # schedule 未到时间：重建一次 job（确保更新内容生效）
-    if post.get("type") == "schedule" and post.get("enabled", True):
+    if post.get("type") == "schedule" and post.get("enabled", True) and ensure_job_queue(context):
         try:
             dt = datetime.fromisoformat(post.get("send_time"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=LOCAL_TZ)
             if dt > now_local():
                 job_name = post.get("job_name", f"schedule_{post_id}")
                 remove_jobs_by_name(context.job_queue, job_name)
-                delay = (dt - now_local()).total_seconds()
+                delay = max(1, int((dt - now_local()).total_seconds()))
                 context.job_queue.run_once(
                     schedule_execute_job,
                     when=delay,
@@ -942,7 +987,7 @@ async def post_del_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("不存在")
         return
     job_name = post.get("job_name")
-    if job_name:
+    if job_name and getattr(context, "job_queue", None) is not None:
         remove_jobs_by_name(context.job_queue, job_name)
     posts = [p for p in posts if p.get("id") != post_id]
     save_posts(posts)
@@ -967,10 +1012,10 @@ async def post_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post["enabled"] = not post.get("enabled", True)
 
     job_name = post.get("job_name")
-    if job_name:
+    if job_name and getattr(context, "job_queue", None) is not None:
         remove_jobs_by_name(context.job_queue, job_name)
 
-    if post["enabled"]:
+    if post["enabled"] and ensure_job_queue(context):
         try:
             if post.get("type") == "daily":
                 tm = parse_time_flexible(post.get("daily_time", ""))
@@ -983,8 +1028,10 @@ async def post_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             elif post.get("type") == "schedule":
                 dt = datetime.fromisoformat(post.get("send_time"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=LOCAL_TZ)
                 if dt > now_local():
-                    delay = (dt - now_local()).total_seconds()
+                    delay = max(1, int((dt - now_local()).total_seconds()))
                     context.job_queue.run_once(
                         schedule_execute_job,
                         when=delay,
@@ -1002,14 +1049,13 @@ async def post_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # =========================
-# Router（一个入口最稳，避免 handler 顺序坑）
+# Router（一个入口最稳）
 # =========================
 async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
 
-    # 任何人都能用 /id（命令已单独 handler，这里不管）
     if not is_admin(user.id):
         return
 
@@ -1029,7 +1075,6 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == M_EDIT:
         return await post_edit_receive(update, context)
 
-    # 空闲：菜单
     if text == "📤 发送帖子":
         return await menu_send(update, context)
     if text == "📝 我的帖子":
@@ -1058,6 +1103,10 @@ async def restore_jobs(app: Application):
         logger.info("无任务可恢复")
         return
 
+    if getattr(app, "job_queue", None) is None:
+        logger.error("JobQueue 缺失：无法恢复任务。请确认 requirements.txt 使用 python-telegram-bot[job-queue].")
+        return
+
     restored = 0
     for p in posts:
         if not p.get("enabled", True):
@@ -1080,9 +1129,11 @@ async def restore_jobs(app: Application):
                     restored += 1
             elif ptype == "schedule":
                 dt = datetime.fromisoformat(p.get("send_time"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=LOCAL_TZ)
                 if dt <= now_local():
                     continue
-                delay = (dt - now_local()).total_seconds()
+                delay = max(1, int((dt - now_local()).total_seconds()))
                 app.job_queue.run_once(
                     schedule_execute_job,
                     when=delay,
@@ -1095,6 +1146,12 @@ async def restore_jobs(app: Application):
 
     save_posts(posts)
     logger.info(f"恢复完成：{restored} 个任务")
+
+# =========================
+# 错误处理（避免 Railway 日志只显示“没反应”）
+# =========================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception:", exc_info=context.error)
 
 # =========================
 # Webhook 启动
@@ -1122,7 +1179,8 @@ def main():
     if not WEBHOOK_BASE:
         raise RuntimeError("WEBHOOK_BASE 为空，请在 Railway Variables 填 WEBHOOK_BASE")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # ✅ post_init 正确写法（更稳）
+    app = Application.builder().token(BOT_TOKEN).post_init(restore_jobs).build()
 
     # 命令
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1146,12 +1204,11 @@ def main():
     # router（唯一消息入口）
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, router))
 
-    # 重启恢复任务
-    app.post_init = restore_jobs
+    # 错误处理
+    app.add_error_handler(on_error)
 
     logger.info("Starting BG678 Webhook Bot…")
     run_webhook(app)
 
 if __name__ == "__main__":
     main()
-
