@@ -1112,7 +1112,7 @@ def run_webhook(app: Application):
         port=PORT,
         url_path=url_path,
         webhook_url=webhook_url,
-        allowed_updates=Application.ALL_TYPES,
+        allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
 
@@ -1154,3 +1154,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
