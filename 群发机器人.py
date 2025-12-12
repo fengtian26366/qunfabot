@@ -1,16 +1,15 @@
 # ============================================================
 # BG678 群发机器人（Webhook 稳定版 / Railway 适用 / PTB v21.7+）
 # 功能：
-# - /start 显示菜单（仅管理员）
+# - /start 菜单（仅管理员）
 # - /id 查看自己的 Telegram 数字ID（任何人可用）
 # - 群内：/register 绑定群，/unregister 解绑群（仅管理员）
 # - 私聊：群管理（查看/删除/清空）
-# - 私聊：立即发送（选择群 -> 发文字/图文）
-# - 私聊：定时发送（一次性：支持 YYYY/MM/DD HH:MM 或 20:30/20点30/9点，默认今天）
-# - 私聊：每日循环发送（每天固定时间）
-# - 任务：查看 / 编辑内容 / 删除 / 启用停用
-# - 重启自动恢复 schedule/daily 任务（从 posts.json）
-# - 新增：若文本/标题/说明中包含 (礼包码)，自动生成“点击复制礼包码”按钮
+# - 私聊：立即发送（选群 -> 选择删除分钟 -> 按钮配置 -> 发内容）
+# - 私聊：定时发送（选群 -> 输入时间 -> 删除分钟 -> 按钮配置 -> 发内容）
+# - 私聊：每日循环（选群 -> 输入时间 -> 删除分钟 -> 按钮配置 -> 发内容）
+# - 我的帖子：查看/编辑内容/删除/启停（按钮也会随任务发出）
+# - 重启恢复 schedule/daily 任务（从 posts.json）
 # ============================================================
 
 import os
@@ -20,7 +19,7 @@ import uuid
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone, time as dtime
-from typing import Optional, Dict, List, Any, Set, Tuple
+from typing import Optional, Dict, List, Any, Set
 
 from telegram import (
     Update,
@@ -28,7 +27,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    CopyTextButton,   # ✅ PTB v21.7+
+    CopyTextButton,  # PTB v21.7+
 )
 from telegram.ext import (
     Application,
@@ -46,7 +45,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # https://xxxx.up.railway.app
 PORT = int(os.getenv("PORT", "8080"))
 
-# 你在柬埔寨一般 +7，如需改成 +8：TZ_OFFSET=8
+# 时区：默认柬埔寨 +7；要改成 +8 就设置 TZ_OFFSET=8
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "7"))
 LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET))
 
@@ -69,7 +68,6 @@ logger = logging.getLogger("BG678WebhookBot")
 
 # =========================
 # 数据文件（跟脚本同目录）
-# Railway 若不挂 Volume，重建容器可能丢文件（建议挂 Volume 或上数据库）
 # =========================
 BASE_DIR = Path(__file__).resolve().parent
 GROUPS_FILE = BASE_DIR / "groups.json"
@@ -83,6 +81,7 @@ STEP = "step"
 TEMP = "temp"
 SELECTED_GROUPS = "selected_groups"
 EDIT_POST_ID = "edit_post_id"
+BUTTONS = "buttons"  # ✅ 新增：保存按钮配置
 
 M_IMMEDIATE = "immediate"
 M_SCHEDULE = "schedule"
@@ -92,7 +91,14 @@ M_EDIT = "edit"
 S_CHOOSE_GROUPS = "choose_groups"
 S_ASK_SEND_TIME = "ask_send_time"
 S_ASK_DELETE_MIN = "ask_delete_min"
-S_ASK_DAILY_TIME = "ask_daily_time"
+
+# ✅ 新增按钮配置步骤
+S_ASK_BUTTON_ENABLE = "ask_button_enable"   # 1不加 2加
+S_ASK_COPY_BTN_TEXT = "ask_copy_btn_text"
+S_ASK_COPY_VALUE = "ask_copy_value"
+S_ASK_URL_BTN_TEXT = "ask_url_btn_text"
+S_ASK_URL_VALUE = "ask_url_value"
+
 S_AWAIT_CONTENT = "await_content"
 
 # =========================
@@ -158,7 +164,7 @@ def content_from_message(msg) -> Dict[str, Any]:
     return {"type": "text", "text": msg.text or msg.caption or ""}
 
 def parse_dt_full(text: str) -> Optional[datetime]:
-    """支持：YYYY/MM/DD HH:MM 或 YYYY/MM/DD HH:MM:SS，默认 LOCAL_TZ"""
+    """支持：YYYY/MM/DD HH:MM 或 YYYY/MM/DD HH:MM:SS（LOCAL_TZ）"""
     if not text:
         return None
     t = text.strip().replace("：", ":")
@@ -211,6 +217,9 @@ def fmt_post(p: Dict[str, Any]) -> str:
     if p.get("type") == "daily":
         s += f"🔁 每日时间: {p.get('daily_time')}\n"
         s += f"🗑 自动删除: {int(p.get('delete_minutes', 0))} 分钟\n"
+    b = p.get("buttons") or {}
+    if b:
+        s += "🔘 按钮: 已配置\n"
     return s
 
 def build_group_keyboard(prefix: str, selected: Set[str]) -> InlineKeyboardMarkup:
@@ -231,54 +240,60 @@ def build_group_keyboard(prefix: str, selected: Set[str]) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(kb)
 
 def ensure_job_queue(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """JobQueue 缺失时，避免你看到‘完全没反应’"""
-    if getattr(context, "job_queue", None) is None:
-        return False
-    return True
+    return getattr(context, "job_queue", None) is not None
 
-# =========================
-# 一键复制礼包码（识别括号里的内容）
-# =========================
-COUPON_RE = re.compile(r"\(([^()\n]{1,256})\)")
+# ============================================================
+# ✅ 模块化：按钮构建 & 发送（你要的“2”）
+# ============================================================
+def is_valid_url(u: str) -> bool:
+    u = (u or "").strip()
+    return u.startswith("https://") or u.startswith("http://")
 
-def extract_coupon(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = COUPON_RE.search(text)
-    if not m:
-        return None
-    code = m.group(1).strip()
-    if not code:
-        return None
-    return code
-
-def build_copy_keyboard(code: str) -> InlineKeyboardMarkup:
-    # ✅ Telegram 原生“复制到剪贴板”按钮
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 点击复制礼包码", copy_text=CopyTextButton(code))]
-    ])
-
-async def send_content_with_optional_copy(context: ContextTypes.DEFAULT_TYPE, chat_id: int, content: Dict[str, Any]):
+def build_buttons(buttons: Optional[Dict[str, Any]]) -> Optional[InlineKeyboardMarkup]:
     """
-    按原样发送文本/图片；如果正文/caption 中有 (xxx) 则自动加复制按钮。
+    buttons 结构：
+    {
+      "copy": {"text": "...", "value": "..."},
+      "url":  {"text": "...", "url": "https://..."}
+    }
     """
+    if not buttons:
+        return None
+
+    row = []
+
+    c = buttons.get("copy")
+    if isinstance(c, dict):
+        text = (c.get("text") or "").strip()
+        value = (c.get("value") or "").strip()
+        if text and value and len(value) <= 256:
+            row.append(InlineKeyboardButton(text, copy_text=CopyTextButton(value)))
+
+    u = buttons.get("url")
+    if isinstance(u, dict):
+        text = (u.get("text") or "").strip()
+        url = (u.get("url") or "").strip()
+        if text and url and is_valid_url(url):
+            row.append(InlineKeyboardButton(text, url=url))
+
+    if not row:
+        return None
+    return InlineKeyboardMarkup([row])
+
+async def send_content(context: ContextTypes.DEFAULT_TYPE, chat_id: int, content: Dict[str, Any], buttons: Optional[Dict[str, Any]] = None):
+    rm = build_buttons(buttons)
+
     if content.get("type") == "photo":
-        caption = content.get("caption", "") or ""
-        code = extract_coupon(caption)
-        rm = build_copy_keyboard(code) if code else None
         return await context.bot.send_photo(
             chat_id=chat_id,
             photo=content.get("photo_id"),
-            caption=caption,
+            caption=content.get("caption", "") or "",
             reply_markup=rm
         )
     else:
-        text = content.get("text", "") or ""
-        code = extract_coupon(text)
-        rm = build_copy_keyboard(code) if code else None
         return await context.bot.send_message(
             chat_id=chat_id,
-            text=text,
+            text=content.get("text", "") or "",
             reply_markup=rm
         )
 
@@ -318,7 +333,6 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"任务数量: {len(p)}\n"
         f"job_queue: {jq}\n"
         f"TZ_OFFSET: {TZ_OFFSET}\n"
-        f"groups: {g}"
     )
 
 # =========================
@@ -417,6 +431,81 @@ async def menu_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("请选择发帖方式：", reply_markup=SEND_MENU)
 
+# ============================================================
+# ✅ 新增：通用按钮配置流程（立即/定时/每日 共用）
+# ============================================================
+async def ask_button_enable(msg, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[STEP] = S_ASK_BUTTON_ENABLE
+    await msg.reply_text(
+        "是否添加按钮？\n"
+        "1️⃣ 不添加\n"
+        "2️⃣ 添加按钮（复制 + 跳转）"
+    )
+
+async def handle_button_flow(msg, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    返回 True 表示已处理（不继续往下）
+    返回 False 表示不在按钮流程，交给别的逻辑
+    """
+    step = context.user_data.get(STEP)
+    text = (msg.text or "").strip()
+
+    if step == S_ASK_BUTTON_ENABLE:
+        if text == "1":
+            context.user_data[BUTTONS] = None
+            context.user_data[STEP] = S_AWAIT_CONTENT
+            await msg.reply_text("请发送要群发的内容（文字或图片+文字）：")
+            return True
+        if text == "2":
+            context.user_data[BUTTONS] = {"copy": {}, "url": {}}
+            context.user_data[STEP] = S_ASK_COPY_BTN_TEXT
+            await msg.reply_text("请输入【复制按钮名称】（例如：Redeem / Claim / Use Code）")
+            return True
+
+        await msg.reply_text("请输入 1 或 2")
+        return True
+
+    if step == S_ASK_COPY_BTN_TEXT:
+        if not text:
+            await msg.reply_text("按钮名称不能为空，请重新输入")
+            return True
+        context.user_data[BUTTONS]["copy"]["text"] = text
+        context.user_data[STEP] = S_ASK_COPY_VALUE
+        await msg.reply_text("请输入【复制内容】（例如：LT79KYN9A）")
+        return True
+
+    if step == S_ASK_COPY_VALUE:
+        if not text:
+            await msg.reply_text("复制内容不能为空，请重新输入")
+            return True
+        if len(text) > 256:
+            await msg.reply_text("复制内容太长（>256），请缩短后再输入")
+            return True
+        context.user_data[BUTTONS]["copy"]["value"] = text
+        context.user_data[STEP] = S_ASK_URL_BTN_TEXT
+        await msg.reply_text("请输入【跳转按钮名称】（例如：Contact Support / Redeem Offer）")
+        return True
+
+    if step == S_ASK_URL_BTN_TEXT:
+        if not text:
+            await msg.reply_text("按钮名称不能为空，请重新输入")
+            return True
+        context.user_data[BUTTONS]["url"]["text"] = text
+        context.user_data[STEP] = S_ASK_URL_VALUE
+        await msg.reply_text("请输入【跳转网址】（必须 http/https 开头，例如：https://t.me/BG678SeniorAdvisor）")
+        return True
+
+    if step == S_ASK_URL_VALUE:
+        if not is_valid_url(text):
+            await msg.reply_text("网址格式不对，请输入 http:// 或 https:// 开头的链接")
+            return True
+        context.user_data[BUTTONS]["url"]["url"] = text
+        context.user_data[STEP] = S_AWAIT_CONTENT
+        await msg.reply_text("✅ 按钮已配置完成。请发送要群发的内容（文字或图片+文字）：")
+        return True
+
+    return False
+
 # =========================
 # 立即发送
 # =========================
@@ -431,6 +520,8 @@ async def immediate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[MODE] = M_IMMEDIATE
     context.user_data[STEP] = S_CHOOSE_GROUPS
     context.user_data[SELECTED_GROUPS] = set()
+    context.user_data[TEMP] = {}
+    context.user_data[BUTTONS] = None
 
     await update.message.reply_text("请选择要发送的群：", reply_markup=build_group_keyboard("im", set()))
 
@@ -471,51 +562,78 @@ async def immediate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not selected:
             await q.answer("请至少选择一个群")
             return
-        context.user_data[STEP] = S_AWAIT_CONTENT
-        await q.answer("请发送内容")
-        await q.message.reply_text("请发送要发送的内容（支持文字、图片+文字）。", reply_markup=ReplyKeyboardRemove())
+        context.user_data[STEP] = S_ASK_DELETE_MIN
+        await q.answer("请输入删除分钟")
+        await q.message.reply_text("若需自动删除，请输入【发送后多少分钟删除】（数字），不删输入 0", reply_markup=ReplyKeyboardRemove())
         try:
             await q.message.delete()
         except Exception:
             pass
         return
 
-async def immediate_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def immediate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get(MODE) != M_IMMEDIATE:
-        return
-    if context.user_data.get(STEP) != S_AWAIT_CONTENT:
         return
 
     msg = update.message
-    groups_map = load_groups()
-    selected: Set[str] = set(context.user_data.get(SELECTED_GROUPS, set()))
-    selected = {cid for cid in selected if cid in groups_map}
 
-    if not selected:
-        await msg.reply_text("❗ 当前可发送群为 0。请重新选择群。", reply_markup=MAIN_KEYBOARD)
-        context.user_data.clear()
+    # 先处理按钮流程（如果在流程里）
+    if await handle_button_flow(msg, context):
         return
 
-    sent, failed = 0, 0
-    reasons = []
+    step = context.user_data.get(STEP)
+    text = (msg.text or "").strip()
 
-    content = content_from_message(msg)
+    if step == S_ASK_DELETE_MIN:
+        if not text.isdigit():
+            await msg.reply_text("❗ 请输入数字分钟或 0")
+            return
+        context.user_data[TEMP]["delete_minutes"] = int(text)
+        await ask_button_enable(msg, context)
+        return
 
-    for cid in selected:
-        try:
-            await send_content_with_optional_copy(context, int(cid), content)
-            sent += 1
-        except Exception as e:
-            failed += 1
-            reasons.append(f"{groups_map.get(cid)} ({cid}) -> {e}")
-            logger.error(f"[立即发送失败] chat={cid} err={e}")
+    if step == S_AWAIT_CONTENT:
+        groups_map = load_groups()
+        selected: Set[str] = set(context.user_data.get(SELECTED_GROUPS, set()))
+        selected = {cid for cid in selected if cid in groups_map}
+        if not selected:
+            await msg.reply_text("❗ 当前可发送群为 0。已取消。", reply_markup=MAIN_KEYBOARD)
+            context.user_data.clear()
+            return
 
-    report = f"🎉 立即发送完成：成功 {sent} 群，失败 {failed} 群。"
-    if reasons:
-        report += "\n\n❌ 失败原因：\n" + "\n".join(reasons[:10])
+        content = content_from_message(msg)
+        buttons = context.user_data.get(BUTTONS)
+        delete_minutes = int(context.user_data.get(TEMP, {}).get("delete_minutes", 0))
 
-    await msg.reply_text(report, reply_markup=MAIN_KEYBOARD)
-    context.user_data.clear()
+        sent_msgs = []
+        sent, failed = 0, 0
+        reasons = []
+
+        for cid in selected:
+            try:
+                m = await send_content(context, int(cid), content, buttons=buttons)
+                sent_msgs.append({"chat_id": cid, "message_id": m.message_id})
+                sent += 1
+            except Exception as e:
+                failed += 1
+                reasons.append(f"{groups_map.get(cid)} ({cid}) -> {e}")
+                logger.error(f"[立即发送失败] chat={cid} err={e}")
+
+        # 立即发送也支持自动删除（如果安装了 job_queue）
+        if delete_minutes > 0 and sent_msgs and ensure_job_queue(context):
+            context.job_queue.run_once(
+                delete_messages_job,
+                when=delete_minutes * 60,
+                data={"messages": sent_msgs}
+            )
+
+        report = f"🎉 立即发送完成：成功 {sent} 群，失败 {failed} 群。"
+        if reasons:
+            report += "\n\n❌ 失败原因：\n" + "\n".join(reasons[:10])
+
+        await msg.reply_text(report, reply_markup=MAIN_KEYBOARD)
+        context.user_data.clear()
+        return
 
 # =========================
 # 定时发送（一次性）
@@ -532,6 +650,7 @@ async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[STEP] = S_CHOOSE_GROUPS
     context.user_data[SELECTED_GROUPS] = set()
     context.user_data[TEMP] = {}
+    context.user_data[BUTTONS] = None
 
     await update.message.reply_text("请选择要定时发送的群：", reply_markup=build_group_keyboard("sc", set()))
 
@@ -575,8 +694,8 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("请发送时间")
         await q.message.reply_text(
             "请发送【发送时间】：\n"
-            "✅ 支持：YYYY/MM/DD HH:MM  或  YYYY/MM/DD HH:MM:SS\n"
-            "✅ 也支持：20:30 / 20点30 / 9点（默认今天）",
+            "✅ YYYY/MM/DD HH:MM  或  YYYY/MM/DD HH:MM:SS\n"
+            "✅ 或：20:30 / 20点30 / 9点（默认今天）",
             reply_markup=ReplyKeyboardRemove()
         )
         try:
@@ -589,8 +708,13 @@ async def schedule_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get(MODE) != M_SCHEDULE:
         return
 
-    step = context.user_data.get(STEP)
     msg = update.message
+
+    # 按钮流程优先
+    if await handle_button_flow(msg, context):
+        return
+
+    step = context.user_data.get(STEP)
     text = (msg.text or "").strip()
 
     if step == S_ASK_SEND_TIME:
@@ -606,7 +730,7 @@ async def schedule_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❗ 发送时间必须晚于当前时间，请重新输入")
             return
 
-        context.user_data[TEMP] = {"send_time": dt.isoformat()}
+        context.user_data[TEMP]["send_time"] = dt.isoformat()
         context.user_data[STEP] = S_ASK_DELETE_MIN
         await msg.reply_text("若需自动删除，请输入【发送后多少分钟删除】（数字），不删输入 0")
         return
@@ -616,13 +740,12 @@ async def schedule_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❗ 请输入数字分钟或 0")
             return
         context.user_data[TEMP]["delete_minutes"] = int(text)
-        context.user_data[STEP] = S_AWAIT_CONTENT
-        await msg.reply_text("请发送要定时群发的内容（文字或图片+文字）：")
+        await ask_button_enable(msg, context)
         return
 
     if step == S_AWAIT_CONTENT:
         if not ensure_job_queue(context):
-            await msg.reply_text("❗ 当前环境缺少 JobQueue 依赖（context.job_queue=None）。请按我给的 requirements.txt 安装 PTB job-queue。", reply_markup=MAIN_KEYBOARD)
+            await msg.reply_text("❗ 当前环境缺少 JobQueue 依赖（job_queue=None）。请按 requirements.txt 安装 PTB job-queue。", reply_markup=MAIN_KEYBOARD)
             context.user_data.clear()
             return
 
@@ -635,9 +758,9 @@ async def schedule_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         post_id = gen_id()
-        temp = context.user_data.get(TEMP, {})
-        send_time = temp["send_time"]
-        delete_minutes = int(temp.get("delete_minutes", 0))
+        send_time = context.user_data[TEMP]["send_time"]
+        delete_minutes = int(context.user_data[TEMP].get("delete_minutes", 0))
+        buttons = context.user_data.get(BUTTONS)
         content = content_from_message(msg)
 
         job_name = f"schedule_{post_id}"
@@ -650,6 +773,7 @@ async def schedule_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "send_time": send_time,
             "delete_minutes": delete_minutes,
             "content": content,
+            "buttons": buttons,
             "enabled": True,
             "job_name": job_name,
         })
@@ -680,12 +804,13 @@ async def schedule_execute_job(context: ContextTypes.DEFAULT_TYPE):
 
     groups = post.get("groups", [])
     content = post.get("content", {})
+    buttons = post.get("buttons")
     delete_minutes = int(post.get("delete_minutes", 0))
 
     sent_msgs = []
     for cid in groups:
         try:
-            m = await send_content_with_optional_copy(context, int(cid), content)
+            m = await send_content(context, int(cid), content, buttons=buttons)
             sent_msgs.append({"chat_id": cid, "message_id": m.message_id})
         except Exception as e:
             logger.error(f"[定时发送失败] post={post_id} chat={cid} err={e}")
@@ -723,6 +848,7 @@ async def daily_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[STEP] = S_CHOOSE_GROUPS
     context.user_data[SELECTED_GROUPS] = set()
     context.user_data[TEMP] = {}
+    context.user_data[BUTTONS] = None
 
     await update.message.reply_text("请选择要每日循环发送的群：", reply_markup=build_group_keyboard("dy", set()))
 
@@ -762,7 +888,7 @@ async def daily_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not selected:
             await q.answer("请至少选择一个群")
             return
-        context.user_data[STEP] = S_ASK_DAILY_TIME
+        context.user_data[STEP] = S_ASK_SEND_TIME
         await q.answer("请输入每日时间")
         await q.message.reply_text("请输入每日发送时间：20:30 / 20点30 / 9点 等", reply_markup=ReplyKeyboardRemove())
         try:
@@ -775,17 +901,22 @@ async def daily_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get(MODE) != M_DAILY:
         return
 
-    step = context.user_data.get(STEP)
     msg = update.message
+
+    # 按钮流程优先
+    if await handle_button_flow(msg, context):
+        return
+
+    step = context.user_data.get(STEP)
     text = (msg.text or "").strip()
 
-    if step == S_ASK_DAILY_TIME:
+    if step == S_ASK_SEND_TIME:
         tm = parse_time_flexible(text)
         if not tm:
             await msg.reply_text("❗ 时间格式错误，请重新输入：20:30 / 20点30 / 9点")
             return
 
-        context.user_data[TEMP] = {"daily_time": text}
+        context.user_data[TEMP]["daily_time"] = text
         context.user_data[STEP] = S_ASK_DELETE_MIN
         await msg.reply_text("若需自动删除，请输入【发送后多少分钟删除】（数字），不删输入 0")
         return
@@ -795,13 +926,12 @@ async def daily_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❗ 请输入数字分钟或 0")
             return
         context.user_data[TEMP]["delete_minutes"] = int(text)
-        context.user_data[STEP] = S_AWAIT_CONTENT
-        await msg.reply_text("请发送每日循环要发送的内容（文字或图片+文字）：")
+        await ask_button_enable(msg, context)
         return
 
     if step == S_AWAIT_CONTENT:
         if not ensure_job_queue(context):
-            await msg.reply_text("❗ 当前环境缺少 JobQueue 依赖（context.job_queue=None）。请按我给的 requirements.txt 安装 PTB job-queue。", reply_markup=MAIN_KEYBOARD)
+            await msg.reply_text("❗ 当前环境缺少 JobQueue 依赖（job_queue=None）。请按 requirements.txt 安装 PTB job-queue。", reply_markup=MAIN_KEYBOARD)
             context.user_data.clear()
             return
 
@@ -814,10 +944,10 @@ async def daily_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         post_id = gen_id()
-        temp = context.user_data.get(TEMP, {})
-        daily_time_raw = temp["daily_time"]
-        delete_minutes = int(temp.get("delete_minutes", 0))
+        daily_time_raw = context.user_data[TEMP]["daily_time"]
+        delete_minutes = int(context.user_data[TEMP].get("delete_minutes", 0))
         tm = parse_time_flexible(daily_time_raw)
+        buttons = context.user_data.get(BUTTONS)
         content = content_from_message(msg)
 
         job_name = f"daily_{post_id}"
@@ -830,6 +960,7 @@ async def daily_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "daily_time": daily_time_raw,
             "delete_minutes": delete_minutes,
             "content": content,
+            "buttons": buttons,
             "enabled": True,
             "job_name": job_name,
         })
@@ -855,12 +986,13 @@ async def daily_execute_job(context: ContextTypes.DEFAULT_TYPE):
 
     groups = post.get("groups", [])
     content = post.get("content", {})
+    buttons = post.get("buttons")
     delete_minutes = int(post.get("delete_minutes", 0))
 
     sent_msgs = []
     for cid in groups:
         try:
-            m = await send_content_with_optional_copy(context, int(cid), content)
+            m = await send_content(context, int(cid), content, buttons=buttons)
             sent_msgs.append({"chat_id": cid, "message_id": m.message_id})
         except Exception as e:
             logger.error(f"[每日发送失败] post={post_id} chat={cid} err={e}")
@@ -911,10 +1043,11 @@ async def post_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     content = post.get("content", {})
     summary = fmt_post(post)
+    await q.message.reply_text(summary)
     if content.get("type") == "photo":
-        await q.message.reply_photo(photo=content.get("photo_id"), caption=summary + "\n(包含图片内容)")
+        await q.message.reply_photo(photo=content.get("photo_id"), caption="(图片内容预览)")
     else:
-        await q.message.reply_text(summary + "\n\n📄 内容：\n" + (content.get("text") or ""))
+        await q.message.reply_text("📄 内容：\n" + (content.get("text") or ""))
     await q.answer("OK")
 
 async def post_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -933,7 +1066,7 @@ async def post_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[STEP] = S_AWAIT_CONTENT
     context.user_data[EDIT_POST_ID] = post_id
     await q.answer("请发送新内容")
-    await q.message.reply_text("请发送新的内容（文字 或 图片+文字）。只改内容，不改时间/群。", reply_markup=ReplyKeyboardRemove())
+    await q.message.reply_text("请发送新的内容（文字 或 图片+文字）。只改内容，不改时间/群/按钮。", reply_markup=ReplyKeyboardRemove())
 
 async def post_edit_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get(MODE) != M_EDIT:
@@ -1049,14 +1182,11 @@ async def post_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # =========================
-# Router（一个入口最稳）
+# Router（唯一消息入口）
 # =========================
 async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user:
-        return
-
-    if not is_admin(user.id):
+    if not user or not is_admin(user.id):
         return
 
     msg = update.message
@@ -1066,8 +1196,9 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (msg.text or "").strip()
     mode = context.user_data.get(MODE)
 
+    # 流程态
     if mode == M_IMMEDIATE:
-        return await immediate_receive(update, context)
+        return await immediate_message(update, context)
     if mode == M_SCHEDULE:
         return await schedule_message(update, context)
     if mode == M_DAILY:
@@ -1075,6 +1206,7 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == M_EDIT:
         return await post_edit_receive(update, context)
 
+    # 空闲态：菜单
     if text == "📤 发送帖子":
         return await menu_send(update, context)
     if text == "📝 我的帖子":
@@ -1104,7 +1236,7 @@ async def restore_jobs(app: Application):
         return
 
     if getattr(app, "job_queue", None) is None:
-        logger.error("JobQueue 缺失：无法恢复任务。请确认 requirements.txt 使用 python-telegram-bot[job-queue].")
+        logger.error("JobQueue 缺失：无法恢复任务。请确认 requirements.txt 使用 python-telegram-bot[job-queue,webhooks].")
         return
 
     restored = 0
@@ -1147,9 +1279,6 @@ async def restore_jobs(app: Application):
     save_posts(posts)
     logger.info(f"恢复完成：{restored} 个任务")
 
-# =========================
-# 错误处理（避免 Railway 日志只显示“没反应”）
-# =========================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled exception:", exc_info=context.error)
 
@@ -1179,7 +1308,6 @@ def main():
     if not WEBHOOK_BASE:
         raise RuntimeError("WEBHOOK_BASE 为空，请在 Railway Variables 填 WEBHOOK_BASE")
 
-    # ✅ post_init 正确写法（更稳）
     app = Application.builder().token(BOT_TOKEN).post_init(restore_jobs).build()
 
     # 命令
@@ -1204,7 +1332,6 @@ def main():
     # router（唯一消息入口）
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, router))
 
-    # 错误处理
     app.add_error_handler(on_error)
 
     logger.info("Starting BG678 Webhook Bot…")
