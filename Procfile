@@ -1,1 +1,1 @@
-web: python checkin_bot.py
+web: python 群发机器人.py
